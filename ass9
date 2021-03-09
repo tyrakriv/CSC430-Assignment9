@@ -1,0 +1,252 @@
+#lang typed/racket
+(require typed/rackunit)
+
+;; ------------------------------------------------------------------
+;; Status: Full Project Implementation
+;; ------------------------------------------------------------------
+;; ------------------------------------------------------------------
+;;  Abstract Syntax
+;; ------------------------------------------------------------------
+(define-type ExprC (U StringC RealC IdC IfC LamC AppC))
+(struct StringC ([str : String]) #:transparent)
+(struct RealC ([n : Real]) #:transparent)
+(struct LamC ([params : (Listof Symbol)] [body : ExprC])#:transparent)
+(struct IdC ([x : Symbol])#:transparent)
+(struct IfC ([a : ExprC] [b : ExprC] [c : ExprC])#:transparent)
+(struct AppC ([operator : ExprC] [operands : (Listof ExprC)])#:transparent)
+
+(define-type Value (U StringV RealV CloV RealV PrimV TrueV FalseV))
+(struct StringV ([s : String]) #:transparent)
+(struct RealV ([n : Real]) #:transparent)
+(struct CloV ([params : (Listof Symbol)] [body : ExprC] [env : Env])#:transparent)
+(struct TrueV ()#:transparent)
+(struct FalseV ()#:transparent)
+ 
+(define-type PrimV (U OpV LeqV EqV ErrorV))
+(struct OpV ([func : (Real Real -> Real)])#:transparent)
+(struct LeqV ([func : (Real Real -> Boolean)])#:transparent)
+(struct EqV ([func : (Any Any -> Boolean)])#:transparent)
+(struct ErrorV ()#:transparent)
+
+(define-type Binding (U bind))
+(struct bind ((name : Symbol) (val : Value))#:transparent)
+ 
+(define-type Env (Listof Binding))
+(define extend-env append)
+
+; Combines parsing and evaluation
+(define (top-interp [s : Sexp]) : String
+  (serialize (interp (parse s) top-env)))
+
+; Serialize function to accept any WTUQ5 value, and return a string
+(define (serialize [s : Value]) : String
+  (match s
+	[(StringV s) (~v s)]
+	[(RealV n) (~v n)]
+	[(CloV p b e) "#<procedure>"]
+	[(TrueV) "true"]
+	[(FalseV) "false"]
+	[PrimV "#<primop>"]))
+ 
+; Interprets the given expression, using the environment and returns a value
+(define (interp [exp : ExprC] [env : Env]) : Value
+  (match exp
+	[(IdC id)
+ 	(if (equal? id 'error) (ErrorV) (env-lookup id env))]
+	[(StringC str) (StringV str)]
+	[(RealC r) (RealV r)]
+	[(IfC a b c)
+ 	(cond
+   	[(equal? (TrueV) (interp a env)) (interp b env)]
+   	[(equal? (FalseV) (interp a env)) (interp c env)]
+   	[else (error 'interp "WTUQ: First value not a boolean: ~e" a)])]  
+	[(LamC params body) (CloV params body env)]
+	[(AppC f a)
+ 	;; 1) look up function
+ 	(define func (interp f env))
+ 	(match func
+   	[(CloV params body clo-env)
+    	;; 2) evaluate argument
+    	(define argvals  (map (lambda ([x : ExprC]) (interp x env)) a))
+    	;; 3a) add to environment
+    	(cond [(not(= (length params) (length argvals))) (error 'interp "WTUQ: wrong arity ~e ~e" params argvals)])
+    	(define new-env (extend-env (map (lambda (p a) (bind p a)) params argvals) clo-env))
+    	;; 4) interp resulting expr
+    	(interp body new-env)]
+   	[(ErrorV) (error 'interp "WTUQ user-error: ~e" (serialize (interp (first a) env)))]
+   	[else
+    	(match a
+      	[(list l r)
+       	(define left (interp l env))
+       	(define right (interp r env))
+       	(interp-primV func left right)]
+      	[else (error 'interp "WTUQ: Illegal number of operands ~e" a)])])]))
+
+; Helper function to evaluate the primitive operations
+(define (interp-primV [fun : Value] [left : Value] [right : Value]) : Value
+  (match fun
+	[(OpV f)
+ 	(cond
+   	[(and (RealV? left) (RealV? right)) (RealV (f (RealV-n left) (RealV-n right)))]
+   	[else (error 'interp "WTUQ: Illegal params: ~e ~e" left right)])]
+	[(LeqV f)
+ 	(cond
+   	[(and (RealV? left) (RealV? right) (f (RealV-n left) (RealV-n right))) (TrueV)]
+   	[(and (RealV? left) (RealV? right)) (f (RealV-n right) (RealV-n left)) (FalseV)]
+   	[else (error 'interp "WTUQ: Illegal params: ~e ~e" left right)])]
+	[(EqV f)
+ 	(cond
+   	[(or (or (CloV? left) (CloV? right))
+        	(or (OpV? left) (OpV? right))
+        	(or (LeqV? left) (LeqV? right))
+        	(or (EqV? left) (EqV? right))) (FalseV)]
+   	[(equal? left right) (TrueV)]
+   	[else (FalseV)])]
+	[else (error 'interp "WTUQ: Not a legal program to interp: ~e" fun)]))
+
+; Parses an expression into an ExprC
+(define (parse [a : Sexp]) : ExprC  
+  (match a
+	[(? real? n) (RealC n)]
+	[(? symbol? a) (if (not (is-illegal? a)) (IdC a) (error 'parse "WTUQ: Illegal id name: ~e" a))]
+	[(? string? a) (StringC a)]
+	[(list 'lam (list (? symbol? params) ...) body)
+ 	(if (check-duplicates params) (error 'parse "WTUQ: Duplicate variable names ~e" params)
+     	(LamC (cast params (Listof Symbol)) (parse body)))]
+	[(list 'if a b c) (IfC (parse a) (parse b) (parse c))]
+	[(list 'local (list (? list? funcs) ...) 'in body)
+ 	(parse (cons (list 'lam (helper-params (cast funcs (Listof (Listof Sexp)))) body)
+              	(body-helper (cast funcs (Listof (Listof Sexp))))))]
+	[(list (? symbol? p) '= body) (LamC (list p) (parse body))]
+	[(list op l ...) (AppC (parse op) (map parse l))]
+	[other (error 'parse "WTUQ: Illegal Sexp to parse ~e" a)]))
+
+; Iterate through and lookup the environment binding list and return the value if it exists
+(define (env-lookup [for : Symbol] [env : Env]) : Value
+  (cond
+	[(empty? env) (error 'env-lookup "WTUQ: name not found ~e" for)]
+	[else (cond
+        	[(symbol=? for (bind-name (first env)))
+         	(bind-val (first env))]
+        	[else (env-lookup for (rest env))])]))
+
+; Creates a list to of the local function names to use as lamda arguments
+(define (helper-params [funcs : (Listof(Listof Sexp))]) : (Listof Sexp)
+  (cond
+	[(empty? funcs) '()]
+	[else
+ 	(if (not (is-illegal? (cast (first (first funcs)) Symbol)))
+     	(cons (first (first funcs))(helper-params (rest funcs)))
+     	(error 'parse "WTUQ: Illegal id name: ~e" (first (first funcs))))]))
+
+; Creates a list of local function bodies for the lambda body
+(define (body-helper [funcs : (Listof(Listof Sexp))]) : (Listof Sexp)
+  (cond
+	[(empty? funcs) '()]
+	[else (cons (third (first funcs))(body-helper (rest funcs)))]))
+
+; Helper function to determine if a function name is an illegal name)
+(define (is-illegal? [s : Symbol]) : Boolean
+  (list? (member s '(in if local lam))))
+
+; Helper Function to check for divide by zero or return the quotient of two Reals
+(define (my-div [l : Real] [r : Real]) : Real
+  (cond
+	[(= r 0) (error 'my-div "WTUQ: Divide by Zero ~e" r)]
+	[else (/ l r)]))
+
+; Inital base environemnt with required operators
+(define top-env (list (bind '+ (OpV +))  
+                  	(bind '- (OpV -))
+                  	(bind '* (OpV *))
+                  	(bind '/ (OpV my-div))
+                  	(bind '<= (LeqV <=))
+                  	(bind 'equal? (EqV equal?))
+                  	(bind 'true (TrueV))
+                  	(bind 'false (FalseV))))
+
+; ------------------------------------------------------------------
+;  Test Cases
+; ------------------------------------------------------------------
+; TOP-INTERP TESTS
+(check-equal? (top-interp '{local [{z = {+ 9 14}} {y = 98}] in  {+ z y}}) "121")
+(check-exn #px"WTUQ: wrong arity" (lambda() (top-interp '((lam () 9) 17))))
+(check-exn #px"WTUQ: Not a legal program to interp:" (lambda() (top-interp '(3 4 5))))
+(check-exn #px"WTUQ user-error:"  (lambda() (top-interp '(+ 4 (error "1234")))))
+(check-equal? (top-interp '{local
+                         	{[doublefunc = {lam {x} {* 2 x}}]
+                          	[add = {lam {m}
+                                      	{lam {n}
+                                           	{lam {f}
+                                                	{lam {a}
+                                                     	{{m f} {{n f} a}}}}}}]
+                          	[one = {lam {f}
+                                      	{lam {a}
+                                           	{f a}}}]
+                          	[two = {lam {f}
+                                      	{lam {a}
+                                           	{f {f a}}}}]}
+                         	in
+                         	{{{{add two} one} doublefunc} 2}}) "16")
+(check-exn #px"WTUQ: Illegal number of operands" (lambda()
+                                                  	(top-interp '{local {[f = {lam {x}
+                                                                                 	{+ {* x x} {* 4 x} 4}}]}
+                                                                 	in
+                                                                 	{f 7}} )))
+(check-exn #px"WTUQ: Illegal number of operands" (lambda()
+                                                  	(top-interp '{<= 1 2 3})))
+(check-equal? (top-interp '{equal? {lam {x}
+                      	{+ {* x x} {* 4 x} 4}} "hello"}) "false")
+(check-exn #px"WTUQ: Illegal id name:" (lambda() (top-interp '{local [{lam = ""}] in "World"})))
+
+
+; SERIALIZE TESTS
+(define str (StringV "test"))
+(define closure (CloV (list 'a 'b) (RealC 2) (list (bind 'x (RealV 1)))))
+(check-equal? (serialize str) "\"test\"")
+(check-equal? (serialize closure) "#<procedure>")
+(check-equal? (serialize (RealV 4)) "4")
+(check-equal? (serialize (TrueV)) "true")
+(check-equal? (serialize (FalseV)) "false")
+(check-equal? (serialize (OpV +)) "#<primop>")
+
+; INTERP TESTS
+(check-equal? (interp (parse '{{lam {z y} {+ z y}} {+ 9 14} 98}) top-env) (RealV 121))
+(check-equal? (interp (parse '{{lam {z y} {<= z y}} {+ 9 14} 98}) top-env) (TrueV))
+(check-equal? (interp (parse '{{lam {z y} {<= z y}} {- 229 14} 98}) top-env) (FalseV))
+(check-equal? (interp (parse '{{lam {z y} {equal? z y}} {* 10 5} 50}) top-env) (TrueV))
+(check-equal? (interp (parse '{{lam {z y} {equal? z y}} {/ 10 5} 50}) top-env) (FalseV))
+(check-exn #px"WTUQ: Illegal params"
+       	(lambda() (interp (parse '{{lam {z y} {+ z y}} {<= "er" "ror"} "no"}) top-env)))
+(check-exn #px"WTUQ: Illegal params"
+       	(lambda() (interp (parse '{{lam {z y} {+ z y}} {+ 3 "hello"} "b"}) top-env)))
+(check-exn #px"WTUQ: Illegal number of operands"
+       	(lambda() (interp (parse '{{lam {z y} {equal? z y}} {equal? 10 5 2} 50}) top-env)))
+(check-exn #px"WTUQ: Divide by Zero" (lambda() (interp (parse '{{lam {z y} {/ z y}} 10 0}) top-env)))
+(check-equal? (interp (parse '{{lam {z y} {equal? z y}} {= = 5} 50}) top-env) (FalseV))
+(check-equal? (interp (parse '(equal? + +)) top-env) (FalseV))
+(check-equal? (interp (parse '(equal? equal? equal?)) top-env) (FalseV))
+(check-equal? (interp (parse '(equal? <= 2)) top-env) (FalseV))
+(check-equal? (interp (parse '{<= 9 14}) top-env) (TrueV))
+(check-equal? (interp (parse '{if {<= 9 14} {+ 3 4} {/ 4 5}}) top-env) (RealV 7))
+(check-equal? (interp (parse '{if {<= 14 9} 4 0}) top-env) (RealV 0))
+(check-exn #px"WTUQ: First value not a boolean:"
+       	(lambda () (interp (parse '{if 4 4 0}) top-env)))
+(check-exn #px"WTUQ: Duplicate variable names" (lambda() (parse '(lam (x x) 3))))
+(check-equal? (interp (parse '(equal? "hello" "hello")) top-env) (TrueV))
+(check-equal? (interp (parse '(equal? {<= 2 3} {<= 1 2})) top-env) (TrueV))
+(check-equal? (interp (parse '(equal? {+ 3 {- 2 3}} 2)) top-env) (TrueV))
+(check-exn #px"WTUQ: Illegal Sexp to parse" (lambda() (parse '{})))
+
+; PARSE TESTS
+(check-equal? (parse '{local [{z = {+ 9 14}}{y = 98}] in {+ z y}})
+          	(AppC (LamC '(z y)(AppC (IdC '+) (list (IdC 'z) (IdC 'y))))
+                	(list(AppC (IdC '+) (list (RealC 9)(RealC 14)))(RealC 98))))
+(check-equal?(parse '{+ 9 14}) (AppC (IdC '+) (list (RealC 9) (RealC 14))))
+(check-equal?(parse '{+ "ty" "ra"})(AppC (IdC '+) (list (StringC "ty") (StringC "ra"))))
+(check-equal?(parse '{if 1 2 0})(IfC (RealC 1) (RealC 2) (RealC 0)))
+(check-equal?(parse '{x = 11})(LamC '(x) (RealC 11)))
+(check-exn #px"WTUQ: Illegal id name:" (lambda() (parse '{+ in lam})))
+
+; ENV-LOOKUP TESTS
+(check-exn #px"WTUQ: name not found" (lambda() (env-lookup 'a '())))
